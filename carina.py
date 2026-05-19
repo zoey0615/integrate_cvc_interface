@@ -72,8 +72,6 @@ def load_models():
 print("Loading UNet++ Models...")
 MODELS = load_models()
 
-
-
 # ─── Logic Functions ─────mask-> points
 def extract_path_points(mask, sample_step=15):
     """把預測出的綠色路徑（Clip Mask）轉化成一串座標點，並存入 CSV"""
@@ -94,51 +92,116 @@ def extract_path_points(mask, sample_step=15):
         sampled_pts.append(pts[-1])
         
     return str(sampled_pts)
-#把導管的骨架點，整理成一條有順序的路徑(二值化遮罩)
-def get_ordered_path(clip_mask, carina_pos=None):
-    # 1. 骨架化
+def get_ordered_path(clip_mask, carina_pos=None, tip_hint=None):
+    """
+    tip_hint: (x, y) 由外部經由過濾後的 AI Tip 遮罩質心提供
+              Level 1 仲裁使用，專門精準破解「折返/Upward Malposition」案例的起點逆序問題
+    """
     skeleton = skeletonize(clip_mask > 0).astype(np.uint8)
-    points = np.column_stack(np.where(skeleton > 0)) # [[y, x], ...]
-    
-    if len(points) < 10: return points
-    
-    # 2. 決定起點 (Start Node)
-    # 找距離 Carina 最遠的端點作為「導管入口起點」
-    if carina_pos is not None:
-        car_y, car_x = carina_pos[1], carina_pos[0]
-        # 計算所有點到 Carina 的距離，取最遠的作為起點
-        dists = np.linalg.norm(points - np.array([car_y, car_x]), axis=1)
-        start_idx = np.argmax(dists)
-    else:
-        # 如果沒抓到 Carina，才勉強用 Y 最小 (脖子方向)
-        start_idx = np.argmin(points[:, 0])
+    points = np.column_stack(np.where(skeleton > 0))  # [[y, x], ...]
+    if len(points) < 10:
+        return points
 
-    # 3. 鄰近搜尋排序 (Nearest Neighbor Search)
-    ordered = []
-    curr_idx = start_idx
-    remaining_indices = list(range(len(points)))
-    
-    # 為了效能，我們不需要排所有的點，但至少要排出一條連續線
-    while len(remaining_indices) > 0:
-        curr_point = points[curr_idx]
-        ordered.append(curr_point)
-        remaining_indices.remove(curr_idx)
-        
-        if not remaining_indices: break
-        
-        # 尋找剩下的點中，距離當前點最近的
-        temp_points = points[remaining_indices]
-        # 使用平方距離加快運算
-        dists = np.sum((temp_points - curr_point)**2, axis=1)
-        nearest_idx_in_temp = np.argmin(dists)
-        
-        # 如果最近的點距離太遠（例如超過 15 像素），代表路徑斷了
-        if dists[nearest_idx_in_temp] > 225: # 15^2
-            break
-            
-        curr_idx = remaining_indices[nearest_idx_in_temp]
-        
-    return np.array(ordered)
+    # ── 內部工具函式 ──────────────────────────────────────────
+    def run_nn_from(start_idx, pts, target_idx=None):
+        """從 start_idx 出發做 Nearest Neighbor，可指定 target_idx 作為終點"""
+        ordered = []
+        remaining = list(range(len(pts)))
+        curr = start_idx
+        while remaining:
+            ordered.append(pts[curr])
+            if target_idx is not None and curr == target_idx:
+                break
+            remaining.remove(curr)
+            if not remaining:
+                break
+            dists = np.sum((pts[remaining] - pts[curr]) ** 2, axis=1)
+            nearest = np.argmin(dists)
+            if dists[nearest] > 225:  # 15px 斷線門檻
+                break
+            curr = remaining[nearest]
+        return np.array(ordered)
+
+    def find_point_idx(target_yx, pts):
+        """找出 target_yx 在 pts 陣列中最近的索引"""
+        dists = np.sum((pts - target_yx) ** 2, axis=1)
+        return int(np.argmin(dists))
+
+    # ── 找骨架端點（鄰居數 == 1 的像素）────────────────────────
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    kernel[1, 1] = 0
+    neighbor_count = cv2.filter2D(skeleton, -1, kernel)
+    endpoint_mask = (skeleton > 0) & (neighbor_count == 1)
+    endpoints = np.column_stack(np.where(endpoint_mask))  # [[y, x], ...]
+
+    if len(endpoints) < 2:
+        # 端點不足，退回傳統邏輯：Y 最小當起點
+        return run_nn_from(np.argmin(points[:, 0]), points)
+
+    # 把所有端點預先映射到 points 陣列的索引
+    ep_indices = np.array([find_point_idx(ep, points) for ep in endpoints])
+
+    tip_idx   = None
+    entry_idx = None
+
+    # ════════════════════════════════════════════════════════════
+    # 【Level 1】AI 篩選後的 Tip 遮罩直接指定
+    #   最可靠！專門處理「折返/Upward Malposition」案例
+    #   因為折返時 Tip 在上方，傳統距離仲裁會選錯方向，這裡直接用 tip_hint 強制鎖定終點！
+    # ════════════════════════════════════════════════════════════
+    if tip_hint is not None:
+        tip_hint_yx = np.array([tip_hint[1], tip_hint[0]])  # (x,y) → (y,x)
+        ep_dists_to_tip = np.sqrt(np.sum((endpoints - tip_hint_yx) ** 2, axis=1))
+        best_ep = np.argmin(ep_dists_to_tip)
+
+        # 距離門檻 120px：太遠代表這個 Tip 提示跟這條骨架對不上，視為雜訊
+        if ep_dists_to_tip[best_ep] < 120:
+            tip_idx = ep_indices[best_ep]
+            # 入口起點 = 離這個 tip_idx 位置物理距離最遠的那個端點（也就是脖子入口）
+            tip_pt = points[tip_idx]
+            other_mask = ep_indices != tip_idx
+            if np.any(other_mask):
+                other_pts = points[ep_indices[other_mask]]
+                far_in_others = np.argmax(np.sqrt(np.sum((other_pts - tip_pt) ** 2, axis=1)))
+                entry_idx = ep_indices[other_mask][far_in_others]
+
+    # ════════════════════════════════════════════════════════════
+    # 【Level 2】解剖學區域篩選 + Carina 距離仲裁（備援機制）
+    #   無 Tip 遮罩，或 Tip 遮罩距骨架太遠時啟用
+    # ════════════════════════════════════════════════════════════
+    if tip_idx is None and carina_pos is not None:
+        car_y_coord, car_x_coord = carina_pos[1], carina_pos[0]
+        upper_mask = endpoints[:, 0] < (car_y_coord + 120)
+
+        if np.any(upper_mask):
+            upper_eps     = endpoints[upper_mask]
+            upper_ep_idxs = ep_indices[upper_mask]
+            dists_to_carina = np.sqrt((upper_eps[:, 0] - car_y_coord) ** 2 + (upper_eps[:, 1] - car_x_coord) ** 2)
+            entry_idx = upper_ep_idxs[np.argmax(dists_to_carina)]
+
+            # Tip = 剩餘端點中離 entry 最遠的
+            other_mask = ep_indices != entry_idx
+            if np.any(other_mask):
+                entry_pt   = points[entry_idx]
+                other_pts  = points[ep_indices[other_mask]]
+                far_in_others = np.argmax(np.sqrt(np.sum((other_pts - entry_pt) ** 2, axis=1)))
+                tip_idx = ep_indices[other_mask][far_in_others]
+            else:
+                tip_idx = ep_indices[0]
+        else:
+            # 純距離仲裁
+            ep_dists = np.sqrt((endpoints[:, 0] - car_y_coord) ** 2 + (endpoints[:, 1] - car_x_coord) ** 2)
+            entry_idx = ep_indices[np.argmax(ep_dists)]
+            tip_idx   = ep_indices[np.argmin(ep_dists)]
+
+    # ════════════════════════════════════════════════════════════
+    # 【Level 3】純 Y 軸（最後防線，連 Carina 都沒抓到時）
+    # ════════════════════════════════════════════════════════════
+    if tip_idx is None:
+        entry_idx = find_point_idx(endpoints[np.argmin(endpoints[:, 0])], points)
+        tip_idx   = find_point_idx(endpoints[np.argmax(endpoints[:, 0])], points)
+
+    return run_nn_from(entry_idx, points, target_idx=tip_idx)
 def detect_carina(image_np):
     h, w = image_np.shape[:2]
     
@@ -244,9 +307,17 @@ def segment(pil_image, threshold_pct: float, alpha_pct: float):   #門檻值百�
     main_tip_x, main_tip_y = None, None 
     is_looping_up = False 
     is_inferred = False 
-
+    infer_text = ""
+    tip_hint = None
+    if all_tip_coords:
+        if len(all_tip_coords) == 1:
+            tip_hint = (all_tip_coords[0][0], all_tip_coords[0][1])
+        else:
+            # 橫向距離仲裁：真正的 Tip（不論深入還是回勾）都會在上腔靜脈附近，離 Carina 的 X 軸最近
+            best_raw_tip = min(all_tip_coords, key=lambda p: abs(p[0] - car_x))
+            tip_hint = (best_raw_tip[0], best_raw_tip[1])
     # 重要：傳入 carina 座標，讓路徑從脖子往胸腔方向排序
-    path_points = get_ordered_path(clip_mask, carina_pos=(car_x, car_y))
+    path_points = get_ordered_path(clip_mask, carina_pos=(car_x, car_y), tip_hint=tip_hint)
 
     # A. 判斷方向 (是否向上回勾)
     if len(path_points) > 20:
